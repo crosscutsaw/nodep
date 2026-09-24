@@ -1,24 +1,28 @@
-## about nodep v0.1
+## about nodep v0.2
 nodep is a kali tool installer without touching apt sources.
 
 ## why?
-nodep is created for offensive security professionals who prefer to use og debian without turning it into a dependency hell or toolslop.
+nodep is created for offensive security professionals who prefer to use og debian without turning it into a dependency hell or toolslop while not wanting kali related system changes.
 
 ## how to use
+* go to [pkg.kali.org](https://pkg.kali.org/)
+* search your package in search bar
+* get it's full or kali name
+* enter it to nodep
+* the package going to be installed
+
+script can be executed with package names and it will automatically select latest versions of packages to install.  
+example: `python3 nodep.py metasploit-framework enum4linux`
+
+or interactive mode can be used by directly executing the script. in this mode versions of packages can be selected to install. 
 ```
-nodep v0.1
+nodep v0.2
 
 you may wipe ~/.nodep folder after everything is done
 
 detected architecture: arm64
 enter full package name (e.g. metasploit-framework): 
 ```
-
-* go to [pkg.kali.org](https://pkg.kali.org/)
-* search your package in search bar
-* get it's full or kali name
-* enter it to nodep
-* the package going to be installed
 
 ### example output of installing and running metasploit-framework on debian 13
 ```

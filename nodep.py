@@ -16,10 +16,22 @@ from html.parser import HTMLParser
 BASE = "https://kali.download/kali/pool"
 SECTIONS = ["main", "non-free", "contrib", "non-free-firmware"]
 PKG_SEARCH = "https://pkg.kali.org/search"
-VERSION = "0.1"
+VERSION = "0.2"
 BOLD_BLUE = "\033[1;34m"
 WHITE = "\033[0;37m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[0;33m"
+RED = "\033[0;31m"
 RESET = "\033[0m"
+
+def info(msg):
+    print(f"{GREEN}{msg}{RESET}")
+
+def warn(msg):
+    print(f"{YELLOW}{msg}{RESET}")
+
+def err(msg):
+    print(f"{RED}{msg}{RESET}")
 
 def get_arch():
     machine = platform.machine()
@@ -312,119 +324,73 @@ def get_depends(deb_path):
     out = subprocess.check_output(["dpkg", "-I", deb_path]).decode(errors="ignore")
     return parse_depends_text(out)
 
-def main():
-    print(f"\n{BOLD_BLUE}nodep v{VERSION}{RESET}\n")
-    print(f"{WHITE}you may wipe ~/.nodep folder after everything is done{RESET}\n")
-
-    arch = get_arch()
-    print(f"detected architecture: {arch}")
-
-    pkgname = input("enter full package name (e.g. metasploit-framework): ").strip()
-    if not pkgname:
-        print("no package name given, exiting")
-        sys.exit(1)
-
-    base_url, files, source = fetch_listing(pkgname)
-    if not base_url:
-        print(f"could not find {pkgname} in any pool section")
-        sys.exit(1)
-
-    print(f"found package at {base_url}")
-
-    candidates = pick_version_for_arch(files, arch, pkgname)
-    if not candidates:
-        print("no matching .deb files found for this package")
-        sys.exit(1)
-
-    print("checking compatibility of each version against your system (no full download yet)")
-    tags = {}
-    for c in candidates:
-        peeked = peek_depends(base_url + c)
-        if peeked is None:
-            tags[c] = "unknown, could not peek at package metadata"
-            continue
-        problems = check_compatibility(peeked)
-        if not problems:
-            tags[c] = "ok"
-        else:
-            critical_hit = any(p["critical"] for p in problems)
-            if critical_hit:
-                bad = ", ".join(p["package"] for p in problems if p["critical"])
-                tags[c] = f"NOT COMPATIBLE, needs newer {bad} than your system has"
-            else:
-                bad = ", ".join(p["package"] for p in problems)
-                tags[c] = f"warning, version mismatch on {bad}"
-
-    print("available versions:")
-    for i, c in enumerate(candidates):
-        print(f"[{i}] {c}  -  {tags.get(c, 'unknown')}")
-
-    home = os.path.expanduser("~")
-    workdir = os.path.join(home, ".nodep", pkgname)
-    depends_dir = os.path.join(workdir, "depends")
-    os.makedirs(workdir, exist_ok=True)
-    os.makedirs(depends_dir, exist_ok=True)
-
-    chosen = None
-    deb_path = None
-    depends = {}
+def select_version(candidates, tags, base_url, workdir, arch, pkgname, interactive):
+    if interactive:
+        info("available versions:")
+        for i, c in enumerate(candidates):
+            print(f"[{i}] {c}  -  {tags.get(c, 'unknown')}")
 
     while True:
-        choice = input("pick the file to install: ").strip()
-        try:
-            idx = int(choice)
-            candidate = candidates[idx]
-        except (ValueError, IndexError):
-            matched = [c for c in candidates if c == choice]
-            if not matched:
-                print("invalid selection")
-                continue
-            candidate = matched[0]
+        if interactive:
+            choice = input("pick the file to install: ").strip()
+            print()
+            try:
+                idx = int(choice)
+                candidate = candidates[idx]
+            except (ValueError, IndexError):
+                matched = [c for c in candidates if c == choice]
+                if not matched:
+                    err("invalid selection")
+                    continue
+                candidate = matched[0]
+        else:
+            usable = [c for c in candidates if tags.get(c) == "ok"]
+            pool = usable if usable else candidates
+            candidate = pick_best_candidate(pool, pkgname, arch, [])
+            if not candidate:
+                candidate = sorted(pool)[-1]
+            info(f"auto picking {candidate}")
 
         candidate_path = os.path.join(workdir, candidate)
         download_file(base_url + candidate, candidate_path)
 
-        print("confirming dependencies against what's installed")
+        info("confirming dependencies against what's installed")
         candidate_depends = get_depends(candidate_path)
         problems = check_compatibility(candidate_depends)
 
         if problems:
-            print(f"\nfinal check: this version does not look compatible with your system:")
+            warn("this version does not look compatible with your system:")
             for p in problems:
                 tag = "CRITICAL" if p["critical"] else "warning"
-                print(f"  [{tag}] {p['package']} needs {p['needs']}, you have {p['installed']}")
+                warn(f"  [{tag}] {p['package']} needs {p['needs']}, you have {p['installed']}")
 
             critical_hit = any(p["critical"] for p in problems)
             if critical_hit:
-                print("this involves core system libraries (libc6/libstdc++6/base-files),")
-                print("forcing this could break dpkg/apt and other software on this box")
+                warn("this involves core system libraries (libc6/libstdc++6/base-files),")
+                warn("forcing this could break dpkg/apt and other software on this box")
 
-            proceed = input("continue anyway? [y/N]: ").strip().lower()
-            if proceed != "y":
-                print("picking a different version")
-                continue
+            if not interactive:
+                if critical_hit:
+                    err(f"skipping {pkgname}, core library mismatch and nothing to ask in batch mode")
+                    return None, None, None
+                warn("continuing anyway in batch mode")
+            else:
+                proceed = input("continue anyway? [y/N]: ").strip().lower()
+                print()
+                if proceed != "y":
+                    info("picking a different version")
+                    continue
 
-        chosen = candidate
-        deb_path = candidate_path
-        depends = candidate_depends
-        break
+        return candidate, candidate_path, candidate_depends
 
-    print("reading dependencies from package")
-    if not depends:
-        print("no dependencies listed")
-    else:
-        print(f"found {len(depends)} dependencies: {', '.join(depends)}")
-
-    print("refreshing apt package lists")
-    subprocess.run(["apt-get", "update"])
-
+def resolve_tree(depends, arch, depends_dir):
     NEVER_TOUCH = {"libc6", "libc6-dev", "libc-bin", "locales", "libc-l10n", "libc-gconv-modules-extra"}
     VIRTUAL_ABI_SUFFIXES = ("-api-min", "-api-max")
     VIRTUAL_IGNORE_SUFFIXES = ("-supported-min", "-supported-max")
     MAX_DEPTH = 1
-
     MAX_PACKAGES = 250
     MAX_ITERATIONS = 3000
+
     resolved = {}
     apt_packages = set()
     decision_version = {}
@@ -438,30 +404,33 @@ def main():
     while queue:
         total_iterations += 1
         if total_iterations > MAX_ITERATIONS:
-            print(f"hit the {MAX_ITERATIONS} iteration safety cap, something is looping, stopping")
+            warn(f"hit the {MAX_ITERATIONS} iteration safety cap, something is looping, stopping")
             break
 
         if processed_count >= MAX_PACKAGES:
-            print(f"hit the {MAX_PACKAGES} package safety cap, stopping resolution early")
+            warn(f"hit the {MAX_PACKAGES} package safety cap, stopping resolution early")
             break
 
         dep, constraints, depth = queue.pop(0)
 
         if dep in NEVER_TOUCH:
-            print(f"resolving {dep}\n  core system package, leaving it as installed and not upgrading")
+            info(f"resolving {dep}")
+            print("  core system package, leaving it as installed and not upgrading")
             installed = get_installed_version(dep)
             if installed is not None:
                 decision_version[dep] = installed
             continue
 
         if dep.endswith(VIRTUAL_IGNORE_SUFFIXES):
-            print(f"resolving {dep}\n  virtual version marker, nothing to install, skipping")
+            info(f"resolving {dep}")
+            print("  virtual version marker, nothing to install, skipping")
             continue
 
         matched_suffix = next((s for s in VIRTUAL_ABI_SUFFIXES if dep.endswith(s)), None)
         if matched_suffix:
             real_name = dep[: -len(matched_suffix)]
-            print(f"resolving {dep}\n  virtual ABI marker, resolving the real package {real_name} instead")
+            info(f"resolving {dep}")
+            print(f"  virtual ABI marker, resolving the real package {real_name} instead")
             queue.append((real_name, [], depth))
             continue
 
@@ -477,7 +446,7 @@ def main():
             continue
 
         processed_count += 1
-        print(f"resolving {dep}")
+        info(f"resolving {dep}")
 
         installed = get_installed_version(dep)
         if installed is not None and all(version_satisfies(installed, op, ver) for op, ver in merged):
@@ -513,7 +482,7 @@ def main():
 
         chosen_dep = pick_best_candidate(dep_candidates, dep, arch, merged)
         if not chosen_dep:
-            print(f"  could not pick a version, skipping")
+            print("  could not pick a version, skipping")
             failed.add(dep)
             failed_signature[dep] = merged
             continue
@@ -536,33 +505,145 @@ def main():
         for sub_name, sub_constraints in sub_depends.items():
             queue.append((sub_name, sub_constraints, depth + 1))
 
-    print(f"\nresolved {len(resolved)} packages from the kali mirror")
+    return resolved, apt_packages, failed
+
+def handle_package(pkgname, arch, interactive):
+    print()
+    info(f"### {pkgname} ###")
+
+    base_url, files, source = fetch_listing(pkgname)
+    if not base_url:
+        err(f"could not find {pkgname} in any pool section")
+        return False
+
+    info(f"found package at {base_url}\n")
+
+    candidates = pick_version_for_arch(files, arch, pkgname)
+    if not candidates:
+        err("no matching .deb files found for this package")
+        return False
+
+    info("checking compatibility of each version against your system (no full download yet)\n")
+    tags = {}
+    for c in candidates:
+        peeked = peek_depends(base_url + c)
+        if peeked is None:
+            tags[c] = "unknown, could not peek at package metadata"
+            continue
+        problems = check_compatibility(peeked)
+        if not problems:
+            tags[c] = "ok"
+        else:
+            critical_hit = any(p["critical"] for p in problems)
+            if critical_hit:
+                bad = ", ".join(p["package"] for p in problems if p["critical"])
+                tags[c] = f"NOT COMPATIBLE, needs newer {bad} than your system has"
+            else:
+                bad = ", ".join(p["package"] for p in problems)
+                tags[c] = f"warning, version mismatch on {bad}"
+
+    home = os.path.expanduser("~")
+    workdir = os.path.join(home, ".nodep", pkgname)
+    depends_dir = os.path.join(workdir, "depends")
+    os.makedirs(workdir, exist_ok=True)
+    os.makedirs(depends_dir, exist_ok=True)
+
+    chosen, deb_path, depends = select_version(
+        candidates, tags, base_url, workdir, arch, pkgname, interactive
+    )
+    if not chosen:
+        return False
+
+    info("reading dependencies from package")
+    if not depends:
+        print("no dependencies listed")
+    else:
+        print(f"found {len(depends)} dependencies: {', '.join(depends)}")
+
+    resolved, apt_packages, failed = resolve_tree(depends, arch, depends_dir)
+
+    print()
+    info(f"resolved {len(resolved)} packages from the kali mirror")
     if apt_packages:
-        print(f"{len(apt_packages)} packages will come from debian apt")
+        info(f"{len(apt_packages)} packages will come from debian apt")
     if failed:
-        print(f"could not resolve anywhere: {', '.join(sorted(failed))}")
+        warn(f"could not resolve anywhere: {', '.join(sorted(failed))}")
 
     if apt_packages:
-        print("\ninstalling the apt-available packages first, apt resolves their own trees")
+        print()
+        info("installing the apt-available packages first, apt resolves their own trees")
         subprocess.run(["apt-get", "install", "-y", "--no-install-recommends"] + sorted(apt_packages))
 
     all_debs = [deb_path] + list(resolved.values())
-    print(f"\ninstalling {len(all_debs)} kali packages")
+    print()
+    info(f"installing {len(all_debs)} kali packages")
 
     max_passes = 3
     for i in range(max_passes):
-        print(f"\ninstall pass {i + 1} of {max_passes}")
+        print()
+        info(f"install pass {i + 1} of {max_passes}")
         result = subprocess.run(["dpkg", "-i"] + all_debs)
         if result.returncode == 0:
-            print("dpkg reported no errors, stopping here")
+            info("dpkg reported no errors, stopping here")
             break
-        print("some packages still blocked, retrying now that more of the batch is unpacked")
+        warn("some packages still blocked, retrying now that more of the batch is unpacked")
 
-    print("\nrunning a final configure pass to settle anything left pending")
+    print()
+    info("running a final configure pass to settle anything left pending")
     subprocess.run(["dpkg", "--configure", "-a"])
     subprocess.run(["apt-get", "install", "-f", "-y"])
+    return True
 
-    print("done")
+def main():
+    print(f"\n{BOLD_BLUE}nodep v{VERSION}{RESET}\n")
+    print(f"{WHITE}you may wipe ~/.nodep folder after everything is done{RESET}\n")
+
+    arch = get_arch()
+    info(f"detected architecture: {arch}")
+
+    raw = " ".join(sys.argv[1:]).strip()
+    interactive = not raw
+
+    if interactive:
+        try:
+            raw = input("enter full package name (e.g. metasploit-framework): ").strip()
+        except EOFError:
+            print()
+            err("no input, exiting")
+            sys.exit(1)
+        print()
+
+    packages = [p.strip() for p in raw.replace(" ", ",").split(",") if p.strip()]
+    if not packages:
+        err("no package name given, exiting")
+        sys.exit(1)
+
+    if len(packages) > 1:
+        info(f"{len(packages)} packages queued: {', '.join(packages)}")
+
+    info("\nrefreshing apt package lists")
+    subprocess.run(["apt-get", "update"])
+
+    results = {}
+    for pkgname in packages:
+        try:
+            results[pkgname] = handle_package(pkgname, arch, interactive)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            err(f"{pkgname} failed: {e}")
+            results[pkgname] = False
+
+    print()
+    if len(packages) > 1:
+        info("summary:")
+        for pkgname, ok in results.items():
+            if ok:
+                info(f"  {pkgname}: done")
+            else:
+                err(f"  {pkgname}: failed")
+
+    info("done")
 
 if __name__ == "__main__":
     try:
